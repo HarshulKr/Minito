@@ -1,0 +1,1114 @@
+## Minito Codebase Detailed Guide
+
+This guide explains how the entire Minito platform works, covering backend architecture, database interaction, frontend flow, all major modules, and the complete user journey for each role. Every file and key logic path is expanded so you can understand the system end-to-end.
+
+---
+
+## 1. Project Overview
+
+Minito is a multi-role “quick-commerce” system built as a real-world logistics-enabled e-commerce platform. It supports:
+
+- **Customers** for browsing, cart, wallet, ordering, and order tracking
+- **Admins** for product/user/store/employee management and analytics
+- **Store Managers** for inventory, order packing, restock, flash sale, expiration handling
+- **Delivery Partners** for claiming available orders, updating delivery status, and tracking earnings
+
+It is built as a **Flask backend** + **React frontend**, with **MySQL** as the database engine.
+
+---
+
+## 2. Repository Structure
+
+```
+/
+  README.md
+  Dump20260415.sql
+  backend/
+    app.py
+    db.py
+    partner_schema.py
+    seed_more.py
+    test_order.py
+    update_db.py
+    routes/
+      admin.py
+      auth.py
+      customer.py
+      delivery.py
+      manager.py
+      order.py
+  frontend/
+    package.json
+    public/
+    src/
+      App.css
+      App.js
+      Cart.js
+      DeliveryApp.js
+      Index.css
+      Login.js
+      ManagerInventory.js
+      OrderHistory.js
+      Products.js
+      AdminDashboard.js
+      index.js
+```
+
+---
+
+## 3. Backend Architecture
+
+### 3.1 app.py
+
+This is the Flask entrypoint.
+
+- Creates a Flask app
+- Enables CORS globally
+- Registers blueprint modules:
+  - `auth`
+  - `customer`
+  - `order`
+  - `admin`
+  - `manager`
+  - `delivery`
+- Defines `/` root route returning a basic health message
+- Starts server on `0.0.0.0:5000` in debug mode
+
+This file is the main server bootstrap that connects all role-specific APIs.
+
+### 3.2 db.py
+
+A simple database helper:
+
+- Uses `mysql.connector.connect`
+- Connects to `localhost`
+- User: `root`
+- Password: `harshul`
+- Database: `minito_db`
+
+Every route imports `get_db()` from this file to open a new DB connection.
+
+### 3.3 Schema & migration scripts
+
+#### partner_schema.py
+
+- Adds `WalletBalance` column to `deliverypartner`
+- Adds `CommissionEarned` column to `orders`
+- Uses `ALTER TABLE ... ADD COLUMN ... DEFAULT`
+- Prints result or existing error
+
+#### update_db.py
+
+- Creates missing tables if not already present:
+  - `employee`
+  - `combos`
+  - `comboitems`
+  - `userbaskets`
+  - `userbasketitems`
+- Seeds example employees and combos
+- Uses `INSERT INTO ... VALUES` and `SELECT COUNT(*)` to avoid duplicate seeding
+
+#### seed_more.py
+
+- Adds 50 store employees across 10 stores
+- Adds 20 additional combo bundles
+- Looks up products by name patterns and inserts combo items
+- Demonstrates seeding logic that enriches product combos and employee data
+
+#### test_order.py
+
+- Simple script to hit `POST /order/create`
+- Useful to validate order API manually
+
+---
+
+## 4. Backend Routes — Role-by-Role
+
+### 4.1 Authentication: auth.py
+
+This route maps role names to database tables:
+
+- `Customer` → `customer`
+- `Admin` → `admin`
+- `Store Manager` → `storemanager`
+- `Delivery Partner` → `deliverypartner`
+
+`POST /auth/login`
+
+- Expects JSON: `{ "role": ..., "email": ... }`
+- Queries the appropriate table by email
+- Adds `Role` to returned payload
+- Converts `WalletBalance` to string for JSON compatibility
+- Returns 404 if user not found
+
+This login flow is role-based and designed for simple demo auth, not secure production login.
+
+---
+
+### 4.2 Customer APIs: customer.py
+
+This module powers the entire customer experience.
+
+#### `GET /customer/products`
+
+- Returns all products with:
+  - `ProductID`
+  - `ProductName`
+  - `Price`
+  - `CategoryID`
+  - `is_flash_sale`
+  - `original_price`
+- Used in product listing and search
+
+#### Cart operations
+
+- `POST /customer/cart/add`
+- `GET /customer/cart/<cid>`
+- `POST /customer/cart/update`
+- `POST /customer/cart/remove`
+
+Cart operations are simple CRUD on `cart` table and rely on:
+
+- `CustomerID`
+- `ProductID`
+- `Quantity`
+
+#### Recommendation & trending
+
+`GET /customer/recommendations/<cid>`
+
+- Finds customer's purchased product frequencies
+- Optionally filters by category
+- If no recommendations, falls back to trending
+
+`GET /customer/trending`
+
+- Returns top products by `SUM(QuantityOrdered)` across all orders
+- Optionally filters by category
+
+These endpoints support personalized and trending product feeds.
+
+#### Combo baskets
+
+- `GET /customer/combos`
+- `POST /customer/custombaskets/save`
+- `GET /customer/custombaskets/<cid>`
+
+Combos are read from `combos` and `comboitems`.
+Custom baskets are stored in `custombaskets` as JSON array of product IDs.
+
+#### Wallet management
+
+- `GET /customer/wallet/<cid>`
+- `POST /customer/wallet/add`
+
+These endpoints support customer digital wallet balance read and top-up.
+
+#### Cart stock validation
+
+`GET /customer/cart/check-stock/<cid>`
+
+- Iterates current cart
+- Checks if each product still has enough stock in any store
+- Automatically removes out-of-stock items
+- Returns removed product names
+
+This endpoint is called periodically by the frontend to keep the cart consistent with inventory.
+
+---
+
+### 4.3 Order lifecycle: order.py
+
+This is the most complex and central backend logic.
+
+#### `POST /order/create`
+
+This API handles multi-store order creation and fulfillment:
+
+1. Parses request items and calculates:
+   - per item price
+   - total required wallet amount
+   - store availability
+
+2. For each cart item:
+   - looks for a store in `storeinventory` where `Quantity >= requested qty`
+   - groups capable items by `StoreID`
+   - accumulates `chargeable_total`
+   - any item unavailable is marked `unfulfilled` and deleted from cart
+
+3. Wallet verification:
+   - reads `WalletBalance`
+   - if insufficient, returns 400
+   - if no fulfillable items remain, returns 400 with message
+
+4. Performs financial reconciliation:
+   - checks sum of store split subtotals matches total charge
+
+5. Updates customer wallet:
+   - deducts `chargeable_total`
+
+6. For each store group:
+   - assigns an available delivery partner from same store if any
+   - marks partner unavailable
+   - credits store manager wallet
+   - inserts an `orders` record with:
+     - `OrderDateTime`
+     - `OrderStatus = Placed`
+     - `TotalBillAmount`
+     - `CustomerID`
+     - `StoreID`
+     - `DeliveryPartnerID`
+   - records `wallettransfers`
+   - inserts `orderitem` for each product
+   - decrements `storeinventory`
+   - deletes item from cart
+
+7. Important concurrency guard:
+   - `UPDATE storeinventory ... AND Quantity >= ?`
+   - if rowcount is zero, the checkout fails and rolls back
+   - this prevents overselling when stock changes during checkout
+
+8. Commits transaction if all operations succeed.
+
+If an exception occurs, the transaction rolls back and returns 500.
+
+#### `POST /order/cancel`
+
+Order cancellation flow:
+
+- Locks order using `SELECT ... FOR UPDATE`
+- Verifies order is currently `Placed`
+- Refunds customer wallet by `TotalBillAmount`
+- Decreases manager wallet by the same amount
+- Inserts negative wallet transfer row
+- Sets order status to `Cancelled`
+- Restores inventory for each item
+- Marks assigned delivery partner available again
+- Commits transaction
+
+This flow keeps financial and inventory state consistent.
+
+#### `GET /order/history/<customer_id>`
+
+- Retrieves all orders for a customer
+- Joins to `darkstore` for store location
+- Loads ordered items for each order
+
+---
+
+### 4.4 Admin APIs: admin.py
+
+This module is the management backbone of the platform.
+
+#### Analytics
+
+- `GET /admin/store-health`
+  - returns store revenue and number of employees
+- `GET /admin/analytics`
+  - returns total platform revenue, total orders, total customers
+
+#### User management
+
+- `GET /admin/users`
+  - returns merged list of customers, managers, delivery partners
+- `POST /admin/users/<role>`
+  - adds:
+    - customer
+    - store manager
+    - delivery partner
+  - includes duplicate email validation for customer and manager
+- `DELETE /admin/users/<role>/<uid>`
+  - cleans up related DB constraints and removes the entity
+
+#### Product management
+
+- `GET /admin/products`
+- `POST /admin/products`
+  - inserts into products
+  - optionally maps product to stores via `storeinventory`
+- `PUT /admin/products/<pid>`
+  - updates product metadata
+- `DELETE /admin/products/<pid>`
+  - cleans related rows from
+    - `orderitem`
+    - `cart`
+    - `storeinventory`
+    - `comboitems`
+    - `userbasketitems`
+    - `products`
+
+#### Employee and store management
+
+- `GET /admin/employees`
+- `POST /admin/employees`
+- `DELETE /admin/employees/<eid>`
+- `GET /admin/darkstores`
+- `POST /admin/darkstores`
+- `DELETE /admin/darkstores/<did>`
+
+#### Audit log
+
+- `GET /admin/audit-log`
+  - lists wallet transfer history
+  - joins customer and manager names
+
+---
+
+### 4.5 Store Manager APIs: manager.py
+
+The manager module contains store-specific operational controls.
+
+#### Inventory alerts
+
+- `GET /manager/inventory/<store_id>`
+- returns products in store with quantity < 10
+
+#### Orders
+
+- `GET /manager/orders/<store_id>`
+- `POST /manager/orders/update`
+  - update order status
+  - optionally assign/override partner
+  - mark partner availability
+  - if status becomes `Delivered`, partner is freed
+
+#### Partners
+
+- `GET /manager/partners/<store_id>`
+- returns delivery partner availability for the store
+
+#### Employees
+
+- `GET /manager/employees/<store_id>`
+- `POST /manager/employees`
+- `DELETE /manager/employees/<employee_id>`
+
+#### Inventory control
+
+- `POST /manager/inventory/restock`
+- `GET /manager/inventory/full/<store_id>`
+  - returns full inventory with expiry, flash sale state, category
+
+#### Flash and expiry workflows
+
+- `POST /manager/create-expiry-combo`
+  - inserts combo bundle for expiry management
+- `POST /manager/dispose-restock`
+  - resets store inventory quantity
+  - updates product expiry date
+- `POST /manager/flash-sale`
+  - marks product as flash sale
+  - halves price and stores original price
+  - prevents duplicate flash sale launch
+
+---
+
+### 4.6 Delivery APIs: delivery.py
+
+This module manages delivery partner operations.
+
+#### Assigned orders
+
+- `GET /delivery/orders/<partner_id>`
+- returns active assigned orders for partner
+- joins customer information
+- loads items for each order
+
+#### Available orders
+
+- `GET /delivery/available-orders/<store_id>`
+- returns orders in `Packed` state without `DeliveryPartnerID`
+
+#### Claiming orders
+
+- `POST /delivery/accept-order`
+  - locks delivery partner row
+  - verifies partner is available
+  - locks order row
+  - ensures no one else claimed it
+  - updates order status to `Picked`
+  - marks partner unavailable
+
+This is the main safety logic preventing double assignment.
+
+#### Earnings
+
+- `GET /delivery/earnings/<partner_id>`
+- computes:
+  - completed delivered orders today
+  - total commission earned today
+  - total wallet balance
+  - history of last 10 completed order commissions
+
+#### Order status updates
+
+- `POST /delivery/orders/update`
+- if marking `Delivered`, it:
+  - locks the order
+  - sets `CommissionEarned = 50` if not already set
+  - credits delivery partner wallet
+  - frees the partner
+- otherwise, simply updates order status
+
+---
+
+## 5. Frontend Architecture
+
+The frontend is a React app built with **Ant Design** and **axios**. It implements full role-based UI flow.
+
+### 5.1 Entry point: index.js
+
+- Uses React 18 root render
+- Wraps app with `ConfigProvider` from Ant Design
+- Sets primary theme color to `#0c831f`
+- Renders `<App />`
+
+### 5.2 Global CSS: App.css
+
+- Minimal default CRA styling
+- Adds `.App` layout and animation styles not heavily used in actual UI
+
+---
+
+## 6. React App Flow
+
+### App.js
+
+This is the main app router:
+
+- Holds `user` and `page` state
+- If `user` is not set: show `<Login />`
+- For each role:
+  - `Admin`: show `<AdminDashboard />`
+  - `Store Manager`: show `<ManagerInventory />`
+  - `Delivery Partner`: show `<DeliveryApp />`
+- Customer routes:
+  - `products`
+  - `cart`
+  - `orders`
+
+This structure centralizes role-based rendering in one place.
+
+---
+
+## 7. Login Flow
+
+### Login.js
+
+- Uses `antd` `Card`, `Select`, `Input`, `Button`
+- User selects role and enters email
+- Sends `POST /auth/login`
+- On success:
+  - stores returned user object
+  - triggers role-based page
+- On failure: shows error
+
+Login is email-only, so the UI depends on database records for each role.
+
+---
+
+## 8. Customer Components
+
+### 8.1 Products.js
+
+This is the richest customer screen.
+
+#### Data loaded
+
+- products
+- cart
+- saved customer baskets
+- wallet balance
+- recommendations
+- trending
+- combos
+
+#### Features
+
+- Search by product name
+- Category filter
+- Flash sale highlighting
+- Add/remove cart items
+- Cart count and wallet display
+- View saved baskets and combos
+- Open a combo drawer to:
+  - customize combo
+  - add combo to cart
+  - save combo as custom basket
+- Persist changes to cart and backend
+- Sync cart state after every update
+
+#### Key user interactions
+
+- `updateCart(pid, qty)`
+  - if qty == 0 → remove item
+  - if item exists → update quantity
+  - if new → add to cart
+- `openComboDrawer(combo)`
+  - opens item customization UI
+- `commitActiveComboToCart()`
+  - adds selected combo items to cart, updating quantities
+- `saveAsMyBasket()`
+  - stores selected basket as custom basket in backend
+
+This component connects many customer features: personalization, search, cart, combos, wallet.
+
+### 8.2 Cart.js
+
+Handles checkout.
+
+#### Data loaded
+
+- cart items
+- wallet balance
+
+#### Features
+
+- Polls every 5 seconds
+  - calls `/customer/cart/check-stock/<cid>`
+  - automatically removes unavailable items
+- Displays cart summary
+- Shows low-balance warning
+- Allows wallet top-up
+- Places order with `POST /order/create`
+- Shows errors if checkout fails
+- Navigates to orders after checkout
+
+#### Checkout behavior
+
+- builds items array from cart
+- sends:
+  - `customer_id`
+  - `total`
+  - `items`
+- handles partial fulfillment and warnings
+
+This file demonstrates the customer ordering lifecycle and stock validation.
+
+### 8.3 OrderHistory.js
+
+- Shows customer order history
+- Loads `/order/history/<cid>`
+- Displays order status timeline
+- Allows cancellation of orders in `Placed` state
+- Updates wallet and refreshes after cancellation
+
+It converts order data into UI steps and cancellation action.
+
+---
+
+## 9. Admin UI
+
+### AdminDashboard.js
+
+The entire platform admin console:
+
+#### Data loaded
+
+- analytics
+- users
+- products
+- store health
+- audit logs
+- employees
+- dark stores
+
+#### Tabs
+
+- Analytics Overview
+- Products
+- Users
+- Employees
+- Dark Stores
+- Wallet Audit Logs
+
+#### Product management
+
+- Add/edit/delete via modal forms
+- Can optionally stock product in selected stores
+
+#### User management
+
+- Add user as:
+  - customer
+  - store manager
+  - delivery partner
+- Delete user with cleanup
+
+#### Store management
+
+- Add/Delete dark stores
+- Auto-cleanups on delete
+
+#### Employee management
+
+- Add/remove platform employees
+
+#### Audit log
+
+- Shows wallet transfer history
+- Includes positive/negative amounts
+
+This page is heavy on CRUD and analytics, showing admin control over the entire platform.
+
+---
+
+## 10. Manager UI
+
+### ManagerInventory.js
+
+Designed for store operations.
+
+#### Data loaded
+
+- low-stock alerts
+- store orders
+- employees
+- full inventory
+- delivery partners
+
+#### Tabs
+
+- Inventory & Orders
+- Full Inventory
+- Expiry Watch
+- Employee Management
+
+#### Capabilities
+
+- Mark orders as `Packed`
+- Assign partner or keep partner assignment optional
+- Mark orders `Delivered`
+- Restock items
+- Dispose and restock expiring products
+- Launch 50% flash sales
+- Create combo bundles from expiring products
+- Add/remove store employees
+
+#### Inventory logic
+
+- `get_full_inventory` displays:
+  - quantity
+  - expiry date
+  - category
+  - price
+  - flash sale state
+
+#### Expiry watch
+
+- Filters inventory with expiring items
+- Shows actions:
+  - dispose/restock
+  - flash sale
+  - convert to combo
+
+This UI enables store-level fulfillment, expiry handling, and operational control.
+
+---
+
+## 11. Delivery Partner UI
+
+### DeliveryApp.js
+
+Provides delivery workflow.
+
+#### Data loaded
+
+- active assigned orders
+- available local orders
+- earnings summary
+- earnings history
+
+#### Features
+
+- Active order list
+- Order status progression:
+  - Packed
+  - Picked
+  - Out for Delivery
+  - Delivered
+- Accept floating orders when no active assignment
+- Earnings dashboard
+- Delivery history table
+
+#### Claim behavior
+
+- `handleAccept(orderId)` calls `POST /delivery/accept-order`
+- catches 409 error if another partner claimed it first
+- refreshes available list after claim
+
+This component coordinates active fulfillment and floating order pickup.
+
+---
+
+## 12. Data Flow and Control Flow
+
+### 12.1 Login flow
+
+- User selects role
+- User enters email
+- Frontend calls `POST /auth/login`
+- Backend returns user object from appropriate table
+- App renders role-specific dashboard
+
+### 12.2 Customer product browsing
+
+- Products.js fetches:
+  - product catalog
+  - current cart
+  - customer baskets
+  - wallet balance
+- Secondary API calls:
+  - recommendations
+  - trending
+  - combos
+- User interacts with add/remove cart operations
+
+### 12.3 Cart and checkout
+
+- Cart.js loads `GET /customer/cart/<cid>`
+- wallet fetch uses `GET /customer/wallet/<cid>`
+- polling to `GET /customer/cart/check-stock/<cid>` ensures data freshness
+- checkout posts to order create
+- if order creation succeeds:
+  - navigates to order history
+  - updates wallet
+
+### 12.4 Order creation internals
+
+The backend implements:
+
+- store grouping by inventory availability
+- partial fulfillment:
+  - unfulfillable items are removed
+- customer wallet deduction
+- manager wallet credit
+- automatic delivery partner assignment
+- multi-order creation for multiple stores
+- inventory decrement with concurrency guard
+- rollback on mismatch or stock race conditions
+
+This is the core business logic of the system.
+
+### 12.5 Order cancellation internals
+
+- locks order row
+- refunds wallet
+- reverses manager credit
+- restores store inventory
+- frees delivery partner
+- updates status to `Cancelled`
+
+### 12.6 Manager operations
+
+- low stock detection
+- restock API
+- flash sale API
+- expiry combo and discard logic
+- assignment of delivery partners
+- order status update with partner availability logic
+
+### 12.7 Delivery operations
+
+- active order tracking
+- claim safely using row locks
+- update delivery status
+- credit commission on delivery completion
+- earnings tracking
+
+---
+
+## 13. Database Design Notes
+
+While the full schema is not included in code, we can infer tables and relationships:
+
+- `customer`
+- `storemanager`
+- `deliverypartner`
+- `admin`
+- `products`
+- `cart`
+- `orders`
+- `orderitem`
+- `storeinventory`
+- `darkstore`
+- `wallettransfers`
+- `combos`
+- `comboitems`
+- `custombaskets`
+- `employee`
+- `category`
+
+Key relational behaviors:
+
+- `cart` uses `CustomerID`, `ProductID`
+- `orders` references `CustomerID`, `StoreID`, and `DeliveryPartnerID`
+- `orderitem` references `OrderID`, `ProductID`
+- `storeinventory` connects `StoreID`, `ProductID`
+- `wallettransfers` tracks order-based wallets between customer and manager
+
+---
+
+## 14. Concurrency and Transaction Management
+
+This project includes careful transaction handling in backend operations:
+
+- `create_order()` uses a single transaction over the entire checkout process
+- `cancel_order()` uses `FOR UPDATE` and rollback to ensure order state is consistent
+- `accept_order()` uses row-level locks to prevent multiple partners claiming the same order
+- Inventory updates are guarded with `WHERE Quantity >= ?` to avoid overselling
+- Wallet updates are made atomically inside transactions
+
+These patterns demonstrate strong DB integrity practices in a multi-user fulfillment environment.
+
+---
+
+## 15. Frontend-Backend Integration
+
+### API base
+
+All frontend requests use:
+
+- `http://${window.location.hostname}:5000`
+
+This means:
+
+- Backend and frontend must run on same machine
+- Frontend accesses backend via local network host
+
+### UI libraries
+
+- React functional components
+- Ant Design for consistent UI elements
+- axios for HTTP requests
+
+### Routing
+
+No React Router is used. App manages UI state manually:
+
+- `user` object selects role
+- `page` string controls customer navigation
+
+---
+
+## 16. Running the Application
+
+### Backend
+
+1. Navigate to backend
+2. Ensure MySQL is running
+3. Create `minito_db`
+4. Run:
+   - `python app.py`
+
+### Frontend
+
+1. Navigate to frontend
+2. Install dependencies:
+   - `npm install`
+3. Start app:
+   - `npm start`
+
+This launches the React app and connects it to Flask backend.
+
+---
+
+## 17. Important Implementation Details
+
+### Role-based record structure
+
+- `auth.login()` intentionally uses role-to-table mapping
+- Admins, managers, customers, and delivery partners are separate tables
+
+### Product and inventory features
+
+- Products.js supports:
+  - flash sale labels
+  - original price display
+  - category filtering
+  - smart baskets and custom baskets
+
+### Order splitting by store
+
+- `order.create_order()` groups cart items by store availability
+- This creates one order per store
+- It models a distributed fulfillment system, not a single-store checkout
+
+### Wallet logic
+
+- Customer wallet is debited at checkout
+- Store manager wallet is credited per store revenue
+- Delivery partner wallet is credited on delivery completion with flat commission
+
+### Combo and basket features
+
+- Product combos are stored in `combos` + `comboitems`
+- Custom baskets are stored in `custombaskets` as JSON arrays
+
+### Inventory expiry
+
+- Manager can:
+  - dispose and restock products
+  - update expiry dates
+  - launch flash sales
+  - create combo bundles from near-expiry inventory
+
+---
+
+## 18. What Each File Does
+
+### Backend
+
+- app.py → app bootstrap
+- db.py → MySQL connection helper
+- partner_schema.py → schema migration helper
+- update_db.py → create supporting tables and seed data
+- seed_more.py → add more employees and combos
+- test_order.py → order API test script
+
+### Backend routes
+
+- auth.py → login and role mapping
+- customer.py → product catalog, cart, wallet, recommendations, combos, custom baskets, stock validation
+- order.py → checkout, cancel, history
+- admin.py → analytics, user/product/store/employee management, audit log
+- manager.py → inventory alerts, order tracking, partner assignment, restock, expiry/flash-sale
+- delivery.py → partner order acceptance, active order list, earnings, status updates
+
+### Frontend
+
+- index.js → entrypoint and Ant Design theme provider
+- App.js → role-based central app router
+- Login.js → login screen
+- Products.js → customer shopping UI
+- Cart.js → customer checkout UI
+- OrderHistory.js → order tracking and cancellation
+- AdminDashboard.js → admin management console
+- ManagerInventory.js → manager dashboard and operations
+- DeliveryApp.js → delivery partner workflow
+- App.css → base styling
+
+---
+
+## 19. Common Use Cases
+
+### Customer journey
+
+1. Login as Customer
+2. Browse products
+3. Add items to cart
+4. View wallet balance
+5. Place order
+6. View order progress
+7. Cancel if still `Placed`
+
+### Store manager journel
+
+1. Login as Store Manager
+2. See low stock alerts
+3. View store orders
+4. Pack orders and assign partners
+5. Launch flash sales on expiring stock
+6. Dispose/restock expired items
+7. Add employees
+
+### Delivery partner journey
+
+1. Login as Delivery Partner
+2. See assigned orders
+3. Claim floating orders
+4. Progress delivery status
+5. Monitor earnings
+
+### Admin journey
+
+1. Login as Admin
+2. View platform analytics
+3. Manage users, products, employees, stores
+4. Inspect audit ledger
+
+---
+
+## 20. Design Intent and Why It Works
+
+Minito is built to mimic a real quick-commerce ecosystem:
+
+- **Multi-store** inventory and fulfillment
+- **Localized delivery assignment**
+- **Role separation** between operations, logistics, customers, and admins
+- **Wallet payment** and refund flows for simplified transaction management
+- **Expiration and flash-sale workflows** for inventory health
+- **Combo and recommendation features** for upsell and basket optimization
+
+This is a strong demonstration of a practical full-stack system built with:
+
+- backend business logic
+- transactional database safety
+- frontend role-aware UI
+- inventory/logistics coordination
+
+---
+
+## 21. Limitations and Improvement Opportunities
+
+### Current limitations
+
+- login is email-only with no password authentication
+- DB credentials are hardcoded in db.py
+- error handling is basic and sometimes opaque
+- frontend routing is state-based, not URL-based
+- there is no explicit authentication token or session management
+
+### Improvements
+
+- add password/secure auth
+- use environment variables for DB config
+- add React Router for deep links
+- implement proper authorization checks in backend
+- add validations and better error responses
+- build unit tests for API endpoints and frontend flows
+
+---
+
+## 22. Practical Notes for Developers
+
+### Database setup
+
+- Use Dump20260415.sql or create schema manually
+- Run update_db.py to ensure support tables exist
+- Optionally run seed_more.py to populate additional sample data
+
+### Running locally
+
+- Start MySQL
+- Run backend with Python
+- Run frontend with npm
+- Open browser and use login roles to access dashboards
+
+### Testing
+
+- test_order.py provides a sample checkout request
+- Use Postman or browser devtools network to inspect API behavior
+
+---
+
+## 23. Summary
+
+This project is a complete, detailed demonstration of:
+
+- multi-role backend architecture
+- role-specific React dashboards
+- distributed order orchestration
+- transactional wallet and inventory flows
+- admin analytics and audit capability
+- store manager logistics and expiry management
+- delivery partner fulfillment lifecycle
+
+Every part of the system is wired together by:
+
+- structured Flask routes
+- MySQL queries and transaction safety
+- React state and Ant Design UI
+- consistent API patterns
+
+If you want, I can also turn this guide into a slide-style technical architecture document or developer onboarding README.
